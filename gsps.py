@@ -27,7 +27,7 @@ class GSPS:
         self.signal ={'ts':0,'signal':None}
         
         self.config = {}
-        self.db = sqlite3.connect('isatc.db')
+        self.db = sqlite3.connect('isatc.db',check_same_thread=False)
         self.get_config_from_db()
 
         self.connect()
@@ -146,20 +146,19 @@ class GSPS:
             self.lock.acquire()
             self.conn = serial.Serial(
                 port=port, baudrate=self.config["baudrate"], 
-                #timeout=self.config["read_timeout"], 
-                #write_timeout=self.config["write_timeout"],
+                timeout=self.config["read_timeout"], 
+                write_timeout=self.config["write_timeout"],
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
                 bytesize=serial.EIGHTBITS
             )
 
             if self.conn.is_open:
-                
                 logging.info('connected')
                 self.lock.release()
                 self.isConnected = True
                 self.iniatialRead = True
-                #self.get_ut_parameter()
+                self.get_ut_parameter()
       
                 return True
         except Exception as e:
@@ -170,23 +169,28 @@ class GSPS:
         return False 
 
     def read_from_port(self):
-        #try:
+        try:
             if self.conn.isOpen() :
                 while True:
-                    tdata = self.conn.readline().decode('ascii')
-                    logging.debug(tdata)
-                    #time.sleep(0.2)
-        #except Exception as e:
-            #ErrorString = str(e)
-            #logging.error(ErrorString)
-            #if ErrorString.find("device reports readiness to read but returned no data") != -1 or ErrorString.find("I/O error") != -1  :
-                #logging.info("exiting")
-                #time.sleep(5)
+                    tdata = self.conn.read().decode('ascii')
+                    time.sleep(0.2)
+                    if self.conn.inWaiting() > 0:
+                        tdata += self.conn.read(self.conn.inWaiting()).decode('ascii')
+
+                    if tdata.strip() != "":
+                        self.parsing_serial(tdata)
+
+        except Exception as e:
+            ErrorString = str(e)
+            logging.error(ErrorString)
+            if ErrorString.find("device reports readiness to read but returned no data") != -1 or ErrorString.find("I/O error") != -1  :
+                logging.info("exiting")
+                time.sleep(5)
 
     def write(self,data,expect=False):
         string =""
         self.lock.acquire() 
-        logging.debug("lock:"+str(time.time()))
+        #logging.debug("lock:"+str(time.time()))
         
         try:
             logging.debug(data.decode('utf-8'))
@@ -208,32 +212,32 @@ class GSPS:
 
         if self.lock.locked():  
             self.lock.release()
-        logging.debug("release:"+str(time.time()))
+        #logging.debug("release:"+str(time.time()))
         return string
         
     def get_ut_parameter(self):
         if self.conn.isOpen() :
-            self.write(b"AT+CNMI=1,2,0,0,0\n")
+            self.write(b"AT+CNMI=1,2,0,0,0\r\n")
             time.sleep(0.5)
-            self.write(b"AT+CREG=2\n")
+            self.write(b"AT+CREG=2\r\n")
             time.sleep(0.5)
-            self.write(b"AT+SKCTIME\n")
+            self.write(b"AT+SKCTIME\r\n")
             time.sleep(0.5)
-            self.write(b"AT+CIMI\n")
+            self.write(b"AT+CIMI\r\n")
             time.sleep(0.5)
-            self.write(b"AT+SKMODEL?\n")
+            self.write(b"AT+SKMODEL?\r\n")
             time.sleep(0.5)
-            self.write(b"AT+CIND?\n")
+            self.write(b"AT+CIND?\r\n")
             time.sleep(0.5)
-            self.write(b"AT+CREG?")
+            self.write(b"AT+CREG?\r\n")
             time.sleep(0.5)
-            self.write(b"AT+SKRGPSPOS=?\n")
+            self.write(b"AT+SKRGPSPOS=?\r\n")
             time.sleep(0.5)
-            self.write(b"AT+CGSN\n")
+            self.write(b"AT+CGSN\r\n")
             time.sleep(0.5)
 
     def fetch_snr(self):
-        self.write(b"AT+CSQ\n")
+        self.write(b"AT+CSQ\r\n")
 
 
     def make_call(self,dest,timeout=False):
@@ -279,12 +283,12 @@ class GSPS:
                         #self.fetch_info()
 
                 ''' make a call every configurable interval '''
-                '''
-                if currentEpoch - lastEpochEgc >= self.config["atcg_interval"] :
+                
+                if self.config["enable_atcg"] and  currentEpoch - lastEpochEgc >= self.config["atcg_interval"]    :
                     lastEpochEgc = currentEpoch
                     self.make_call(self.config["atcg_dest"])
                     self.atcgOnGoing = True
-                '''
+                
             except Exception as e:
                 logging.error(str(e))
 
@@ -295,8 +299,9 @@ class GSPS:
         try:
             data = str(data)
             parts =  re.split(",|:|\r\n|\r",data.strip())
-            parts = map(str.strip,parts)
+            parts = list(map(str.strip,parts))
             length = len(parts)
+            print(parts)
 
             MatchImei = re.match( r"^(353\d{12})\s+OK", data.strip(),re.MULTILINE)
             if MatchImei:
@@ -332,7 +337,7 @@ class GSPS:
                 i = find_last(parts,"+CSQ")
 
                 ts = int(time.time())
-                sqlstr="INSERT INTO csq (rssi ,ber,time) VALUES( ?,?,?)"
+                sqlstr="INSERT INTO gsps_snr_ber (snr ,ber,timestamp) VALUES( ?,?,?)"
                 self.db.execute(sqlstr,(parts[i+1],parts[i+2],ts))
                 self.db.commit()
 
@@ -413,8 +418,8 @@ class GSPS:
                 elif parts[i+3] == "4":
                     val ="Incoming call from : "+parts[i+7] +" on progress"
 
-                    if self.config["inComeSet"]:
-                        if self.config["inCome"].strip() == "" or parts[i+7].strip() == self.config["inCome"].strip() :
+                    if self.config["mt_auto_answer"]:
+                        if self.config["mt_number"].strip() == "" or parts[i+7].strip() == self.config["mt_number"].strip() :
                             self.write("ATA" + '\r\n')
 
                     self.status["ONG"] = 1
@@ -439,12 +444,12 @@ class GSPS:
                 i = find_last(parts,"+CIMI")
                 self.deviceInfo["IMSI"] = parts[i+1].replace('"','')
 
-                sql="REPLACE INTO site_meta (type ,value) VALUES( 'IMSI', ?)"
-                self.db.execute(sql,(self.deviceInfo["IMSI"],))
-                self.db.commit()
+                #sql="REPLACE INTO site_meta (type ,value) VALUES( 'IMSI', ?)"
+                #self.db.execute(sql,(self.deviceInfo["IMSI"],))
+                #self.db.commit()
 
-                if self.deviceInfo["IMSI"] != self.config["IMSI"] :
-                    logging.warning("IMSI changed from "+self.config["IMSI"]+" to "+self.deviceInfo["IMSI"])
+                #if self.deviceInfo["IMSI"] != self.config["IMSI"] :
+                    #logging.warning("IMSI changed from "+self.config["IMSI"]+" to "+self.deviceInfo["IMSI"])
 
                 self.broadcast(self.deviceInfo)
 
@@ -496,9 +501,8 @@ class GSPS:
         except Exception as e:
             logging.error(str(e))
 
-        logging.debug(data.replace('OK','').strip())
+        #logging.debug(data.replace('OK','').strip())
         #print info
-
 
     def get_device_info(self):
         return {"error":"","data":self.deviceInfo}
