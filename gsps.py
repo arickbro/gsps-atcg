@@ -13,19 +13,282 @@ import re
 
 logging.basicConfig(format='%(levelname)s:%(message)s', level=logging.DEBUG)
 
+class ReaderThread(threading.Thread):
+    def __init__(self, main_instance):
+        super().__init__()
+        self.main = main_instance
+
+    def run(self):
+        try:
+            if self.main.conn.isOpen() :
+                logging.info("reader connected") 
+                while True:
+                    tdata = self.main.conn.read().decode('ascii')
+                    time.sleep(0.2)
+                    if self.main.conn.inWaiting() > 0:
+                        tdata += self.main.conn.read(self.main.conn.inWaiting()).decode('ascii')
+
+                    if tdata.strip() != "":
+                        self.parsing_serial(tdata)
+            else:
+                print("reader not connected")
+
+        except Exception as e:
+            ErrorString = str(e)
+            logging.error(ErrorString)
+            if ErrorString.find("device reports readiness to read but returned no data") != -1 or ErrorString.find("I/O error") != -1  :
+                logging.info("exiting")
+                time.sleep(5)
+                self.main.connect()
+
+    def parsing_serial(self,data):
+        try:
+            data = str(data)
+            parts =  re.split(",|:|\r\n|\r",data.strip())
+            parts = list(map(str.strip,parts))
+            length = len(parts)
+            
+            MatchImei = re.search( r"(353\d{12})", data.strip(),re.MULTILINE)
+            if MatchImei:
+                self.main.deviceInfo["IMEI"] = MatchImei.group(1)
+
+            if data.find("+SKRGPSPOS:") != -1:
+                i = find_last(parts,"+SKRGPSPOS")
+                if parts[i+1]=="1":
+                    self.main.deviceInfo["gpsStatus"] = "Valid"
+                else:
+                    self.main.deviceInfo["gpsStatus"] = "Invalid"
+
+                self.main.deviceInfo["gpsLatitude"] = parts[i+2]
+                self.main.deviceInfo["gpsLongitude"] = parts[i+3]
+                self.main.deviceInfo["gpsAltitude"] = parts[i+4]
+                self.main.deviceInfo["gpsTimestamp"] = parts[i+5]+" "+parts[i+6]+":"+parts[i+7]+":"+parts[i+8]
+                self.main.deviceInfo["gpsTimestamp"] = self.main.deviceInfo["gpsTimestamp"].replace("/","-")
+
+                self.main.broadcast(self.main.deviceInfo)
+
+            if data.find("+SKCTIME:") != -1:
+                i = find_last(parts,"+SKCTIME")
+                self.main.deviceInfo["gpsTimestamp"] = parts[i+1]+" "+parts[i+2]+":"+parts[i+3]+":"+parts[i+4]
+                self.main.deviceInfo["gpsTimestamp"] = self.main.deviceInfo["gpsTimestamp"].replace("/","-")
+                #os.system("date -s '"+info["LOC_TIME"]+"'")
+                self.main.broadcast(self.main.deviceInfo)
+
+            if data.find("RING") != -1:
+                logging.info("ringing")
+                self.main.broadcast({"respond":"ring","data":"Ringing"})
+
+            if data.find("+CSQ:") != -1:
+                i = find_last(parts,"+CSQ")
+
+                ts = int(time.time())
+                sqlstr="INSERT OR IGNORE INTO gsps_snr_ber (snr ,ber,timestamp) VALUES(?,?,?)"
+                self.main.db.execute(sqlstr,(parts[i+1],parts[i+2],ts))
+                self.main.db.commit()
+
+                csq ={"respond":"csq","rssi":parts[i+1], "ber":parts[i+2]}
+                self.main.signal = {'ts':ts,'rssi':parts[i+1], 'ber':parts[i+2]}
+                self.main.broadcast(csq)
+                    
+            if data.find("+CMGS:") != -1:
+                self.main.WaitingForCMGS = False
+                i = find_last(parts,"+CMGS")
+                logging.info("SMS:"+parts[i+1]+" LENGTH:"+parts[i+2])
+
+                sqlstr="UPDATE sms_log set status = 'sent' where sms_id=?"
+                self.main.db.execute(sqlstr,(self.main.LastSMSId,))
+                self.main.db.commit()
+
+                self.main.broadcast({"respond":"call_info","data":"SMS Sent"})
+
+            if data.find("+CMT:") != -1:
+                i = find_last(parts,"+CMT")
+                sms = SmsDeliver(parts[i+3])
+
+                sql = "INSERT INTO sms_log (type, dest, content,content_length,status) VALUES (?,?,?,?,?)"
+                self.main.db.execute(sql, (0,sms.number,sms.text,parts[i+2],'receieved'))
+                self.main.db.commit()
+                self.main.LastSMSId =  self.main.db.cursor.lastrowid
+                self.main.broadcast({"respond":"sms","from":sms.number,"text":sms.text})
+
+            if data.find("+CREG:") != -1:
+                i = find_last(parts,"+CREG")
+                if i+4 < length and parts[i+4] =="OK" :
+                    offset = 0
+                elif i+6 <= length and parts[i+6] =="OK" :
+                    offset = 0
+                    lac =int(parts[i+3+offset].replace('"',''),16)
+                    self.main.deviceInfo["cellIdentity"] = int(parts[i+4+offset].replace('"',''),16)
+                    self.main.deviceInfo["locationAreaCode"] = {'RNC': lac >> 10, 'SB':(lac & 1023)}
+                else:
+                    offset = -1
+                    lac =int(parts[i+3+offset].replace('"',''),16)
+                    self.main.deviceInfo["cellIdentity"] = str(int(parts[i+4+offset].replace('"',''),16))
+                    self.main.deviceInfo["locationAreaCode"] = {'RNC': lac >> 10, 'SB':(lac & 1023)}
+
+                if  parts[i+2+offset] == "1" :
+                    REG  = "Yes"
+                    self.main.IsRegistered = True
+                    self.main.deviceInfo["registrationInfo"]= ""
+
+                elif parts[i+2+offset] == "2" :
+                    self.main.IsRegistered = False
+                    REG  = "Searching .... "
+                    self.main.deviceInfo["registrationInfo"]= REG
+
+                else:
+                    self.main.IsRegistered = False
+                    REG  = "No"
+                    self.main.deviceInfo["registrationInfo"]= "not registered"
+
+
+                self.main.deviceInfo["registered"] = REG
+
+            if data.find("+SKCCSI:") != -1:
+                i = find_last(parts,"+SKCCSI")
+
+                val =""
+
+                if parts[i+2] =="0" and i+6 < length:
+                    sqlstr="UPDATE call_log set disc_cause = ? ,call_stat = ?  where call_id =? "
+                    self.main.db.execute(sqlstr,(parts[i+6],parts[i+3],str(self.main.LastCallId)))
+                    self.main.db.commit()
+
+                if parts[i+3] == "2":
+                    val ="Outgoing call to : "+parts[i+7]
+                elif parts[i+3] == "0":
+                    val ="User picked up the call "
+                elif parts[i+3] == "3":
+                    val ="Outgoing call to : "+parts[i+7]   +" on progress"
+                    self.main.status["ongoingCall"] = 1
+                    self.main.status["lastCall"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                elif parts[i+3] == "4":
+                    val ="Incoming call from : "+parts[i+7] +" on progress"
+
+                    if self.main.config["mt_auto_answer"]:
+                        if self.main.config["mt_number"].strip() == "" or parts[i+7].strip() == self.main.config["mt_number"].strip() :
+                            self.main.write("ATA" + '\r\n')
+
+                    self.main.status["ongoingCall"] = 1
+
+                elif parts[i+3] == "6":
+                    val ="call disconnected"
+                    self.main.status["ongoingCall"] = 0
+                
+                self.main.broadcast(self.main.deviceInfo)
+
+            if data.find("+SKCTVI:") != -1:
+                i = find_last(parts,"+SKCTVI")
+                val ="Call lasted for "+parts[i+2]+"s"
+
+                sqlstr="UPDATE call_log set dur = ? where  call_id =? "
+                self.main.db.execute(sqlstr,(parts[i+2],str(self.main.LastCallId)))
+                self.main.db.commit()
+
+                self.main.broadcast({"respond":"call_info","data":val})
+
+            if data.find("+CIMI:") != -1:
+                i = find_last(parts,"+CIMI")
+                IMSI = parts[i+1].replace('"','')
+
+                if self.main.deviceInfo["IMSI"] != None and IMSI != self.main.config["IMSI"] :
+                    logging.warning("IMSI changed from "+self.main.config["IMSI"]+" to "+self.main.deviceInfo["IMSI"])
+
+                self.main.deviceInfo["IMSI"] = IMSI
+                self.main.broadcast(self.main.deviceInfo)
+
+            if data.find("+CIND:") != -1:
+                i = find_last(parts,"+CIND")
+                self.main.status["signalStrength"] =parts[i+1]
+                self.main.status["service"] = "Ready for service" if parts[i+2]=="1" else "No service"
+                self.main.status["isRoaming"] =  "Yes" if parts[i+3]=="1" else "No"
+                self.main.status["isSmsFull"] =parts[i+4]
+
+                self.main.broadcast(self.main.status)
+
+            if data.find("+SKCNLI:") != -1:
+                i = find_last(parts,"+SKCNLI")
+                self.main.status["PROV1"] =parts[i+1]
+                self.main.status["PROV2"] =parts[i+2]
+                self.main.status["MCC"] =parts[i+3]
+                self.main.status["CID"] =parts[i+5]
+
+                self.main.broadcast(self.main.status)
+
+            if data.find("+SKMODEL:") != -1:
+                i = find_last(parts,"+SKMODEL")
+                self.main.deviceInfo["model"] =parts[i+1].replace('"','')
+                #self.main.broadcast(self.main.deviceInfo)
+
+            if data.find("+SKGPSPOSI:") != -1:
+                i = parts.index("+SKGPSPOSI")
+                self.main.deviceInfo["gpsStatus"] == "Valid" if parts[i+1]=="1" else "Invalid"
+                #self.main.broadcast(self.main.deviceInfo)
+
+            if data.find("+CIEV:") != -1:
+                i = find_last(parts,"+CIEV")
+                index = int(parts[i+1])
+                value = parts[i+2]
+                cind = {1:"battery",2:"signalStrength",3:"service",4:"sounder",5:"smsRec",6:"callInProgress",7:"tx",8:"isRoaming",9:"isSmsFull"}
+                if cind[index] =="service":
+                    value = "Ready for service" if value=="1" else "No service"
+
+                self.main.status[cind[index]]= value
+                self.main.broadcast(self.main.status)
+
+            if data.find("+SKEXTREG:") != -1:
+                i = find_last(parts,"+SKEXTREG")
+                index = parts[i+1]
+                self.main.deviceInfo["registrationInfo"]= index
+
+            self.main.broadcast(data)
+        except Exception as e:
+            logging.error(str(e))
+
+        logging.debug(data.replace('OK','').strip())
+
+
+
 class GSPS:
+
     def __init__(self):
         self.isConnected = False
         self.conn = False
         self.LastCallId = None
         self.wss = []
         self.SMSQueue = []
-        self.deviceInfo = {}
-        self.status = {}
+        self.deviceInfo = {
+            'IMSI':None,
+            'IMEI':None,
+            'model':None,
+            'gpsStatus':None,
+            'gpsLatitude':None,
+            'gpsLongitude':None,
+            'cellIdentity':None,
+            'locationAreaCode':None,
+            'gpsTimestamp':None,
+            'registered':None,
+            'registrationInfo':None,
+        }
+        self.status = {
+            'battery':None,
+            'isSmsFull':None,
+            'signalStrength':None,
+            'service':None,
+            'sounder':None,
+            'smsRec':None,
+            'callInProgress':None,
+            'tx':None,
+            'isRoaming':None,
+            'ongoingCall':None,
+            'lastCall':None
+        }
+        
         self.atcgOnGoing =False
         self.lock = threading.Lock() 
-        self.signal ={'ts':0,'signal':None}
+        self.signal ={'ts':0,'rssi':None, 'ber':None}
         
+        self.gb = 0
         self.config = {}
         self.db = sqlite3.connect('isatc.db',check_same_thread=False)
         self.get_config_from_db()
@@ -34,8 +297,8 @@ class GSPS:
         self.daemon = threading.Thread(target=self.keep_alive, args=())
         self.daemon.start()
 
-        self.serialReader = threading.Thread(target=self.read_from_port, args=())
-        self.serialReader.start()
+        self.thread = ReaderThread(self)
+        self.thread.start()
 
     def get_port(self):
         prefix = "/dev/ttyACM"
@@ -58,17 +321,16 @@ class GSPS:
             cursor = self.db.execute("SELECT * from isatc_config")
             for row in cursor:
                 if row[2] == "int":
-                    result['data'][row[0]] = int(row[1])
+                    self.config[row[0]] = int(row[1])
                 elif row[2] == "bytes":
-                    result['data'][row[0]] = bytes(row[1], 'utf-8')
+                    self.config[row[0]] = bytes(row[1], 'utf-8')
                 else:
-                    result['data'][row[0]]  = None if row[1].strip() == '' else row[1].strip()
+                    self.config[row[0]]  = None if row[1].strip() == '' else row[1].strip()
+                result['data'][row[0]] = row[1]
 
         except Exception as e:
             result["error"] = str(e)
 
-        self.config = result['data']
-        print(self.config)
         return result
 
     def set_config(self,config):
@@ -86,22 +348,23 @@ class GSPS:
     def get_historical_snr(self,param):
         result = {"error":"","data":[]}
         try:
-            sql = "select (timestamp/?)*? as ts, avg(signal_level), sum(ber) as snr from gsps_signal where timestamp >= ? and timestamp < ? group by ts "
+            sql = "select (timestamp/?)*? as ts, avg(signal_level), sum(ber) as snr from gsps_snr_ber where timestamp >= ? and timestamp < ? group by ts "
             cursor = self.db.execute(sql, (param['bucket'],param['bucket'],param['start'],param['end']))
             for row in cursor:
                 result["data"].append(row)
         except Exception as e:
             result["error"] = str(e)
         return result
+
     def get_calls(self,param):
 
-        result = {"error":"","columns":["les","service","priority","lang","timestamp","bytes","sequence","error","repetition","filename"], "rows":[],"count":None}
-        sql = "select count(timestamp) from isatc_egc where timestamp >= ? and timestamp < ? "
+        result = {"error":"","columns":["timestamp","call_id","disc_cause","call_stat","dest_num"], "rows":[],"count":None}
+        sql = "select count(timestamp) from call_log where timestamp >= ? and timestamp < ? "
         try:
             cursor = self.db.execute(sql, (param['start'],param['end']))
             result["output"] = cursor.fetchone()[0]
             
-            sql = "select "+",".join(result["columns"])+" from gsps_calls where timestamp >= ? and timestamp < ?  LIMIT ? OFFSET ?"
+            sql = "select "+",".join(result["columns"])+" from call_log where timestamp >= ? and timestamp < ?  LIMIT ? OFFSET ?"
             cursor = self.db.execute(sql, (param['start'],param['end'],param['limit'],param['offset']))
             for row in cursor:
                 result["data"].append(row)
@@ -111,13 +374,13 @@ class GSPS:
 
     def get_sms(self,param):
 
-        result = {"error":"","columns":["filename","timestamp","bytes","content"], "rows":[],"count":None}
-        sql = "select count(timestamp) from isatc_dir where timestamp >= ? and timestamp < ? "
+        result = {"error":"","columns":["timestamp","sms_id","type","dest","content","content_length","status"], "rows":[],"count":None}
+        sql = "select count(timestamp) from sms_log where timestamp >= ? and timestamp < ? "
         try:
             cursor = self.db.execute(sql, (param['start'],param['end']))
             result["output"] = cursor.fetchone()[0]
             
-            sql = "select "+",".join(result["columns"])+" from gsps_sms where timestamp >= ? and timestamp < ?  LIMIT ? OFFSET ?"
+            sql = "select "+",".join(result["columns"])+" from sms_log where timestamp >= ? and timestamp < ?  LIMIT ? OFFSET ?"
             cursor = self.db.execute(sql, (param['start'],param['end'],param['limit'],param['offset']))
             for row in cursor:
                 result["data"].append(row)
@@ -168,29 +431,10 @@ class GSPS:
         
         return False 
 
-    def read_from_port(self):
-        try:
-            if self.conn.isOpen() :
-                while True:
-                    tdata = self.conn.read().decode('ascii')
-                    time.sleep(0.2)
-                    if self.conn.inWaiting() > 0:
-                        tdata += self.conn.read(self.conn.inWaiting()).decode('ascii')
-
-                    if tdata.strip() != "":
-                        self.parsing_serial(tdata)
-
-        except Exception as e:
-            ErrorString = str(e)
-            logging.error(ErrorString)
-            if ErrorString.find("device reports readiness to read but returned no data") != -1 or ErrorString.find("I/O error") != -1  :
-                logging.info("exiting")
-                time.sleep(5)
 
     def write(self,data,expect=False):
         string =""
         self.lock.acquire() 
-        #logging.debug("lock:"+str(time.time()))
         
         try:
             logging.debug(data.decode('utf-8'))
@@ -212,7 +456,7 @@ class GSPS:
 
         if self.lock.locked():  
             self.lock.release()
-        #logging.debug("release:"+str(time.time()))
+
         return string
         
     def get_ut_parameter(self):
@@ -242,14 +486,14 @@ class GSPS:
 
     def make_call(self,dest,timeout=False):
         self.write("ATD"+dest+";" + '\r\n')
-        sql ="INSERT INTO `call_log`( `dest_num`, `call_stat`,`disc_cause`,ts) VALUES (?,?,?,?)"
+        sql ="INSERT INTO `call_log`( `dest_num`, `call_stat`,`disc_cause`,timestamp) VALUES (?,?,?,?)"
         self.db.execute(sql,(dest,0,0,int(time.time())))
         self.db.commit()
         self.LastCallId =  self.db.cursor.lastrowid
 
         if timeout != False:                               
             time.sleep(timeout)
-            self.write("ATH" + '\r\n')
+            self.write(b"ATH" + '\r\n')
 
     def make_sms(self,dest,content):
         sms = SmsSubmit(dest,content)
@@ -261,17 +505,10 @@ class GSPS:
     def keep_alive(self):
         currentEpoch = 0
         lastEpoch = 0
-        lastEpochEgc = 0
-        lastEpochEmail = 0
+        lastEpochCall = 0
 
         while True:
-      
-            if self.isConnected == False:
-                logging.debug("not connected ")
-                time.sleep(5)
-                self.connect()
-                continue
-                
+                    
             try:
                 currentEpoch = int(time.time())
                 '''read signal strength every 10 secs'''
@@ -279,13 +516,11 @@ class GSPS:
                     lastEpoch = currentEpoch
                     logging.debug("check signal level")
                     self.fetch_snr()
-                    #if ( self.signal['signal'] != None and self.signal['signal'] > 0):
-                        #self.fetch_info()
 
                 ''' make a call every configurable interval '''
                 
-                if self.config["enable_atcg"] and  currentEpoch - lastEpochEgc >= self.config["atcg_interval"]    :
-                    lastEpochEgc = currentEpoch
+                if self.config["enable_atcg"] and  currentEpoch - lastEpochCall >= self.config["atcg_interval"]    :
+                    lastEpochCall = currentEpoch
                     self.make_call(self.config["atcg_dest"])
                     self.atcgOnGoing = True
                 
@@ -295,214 +530,6 @@ class GSPS:
             time.sleep(1)
 
 
-    def parsing_serial(self,data):
-        try:
-            data = str(data)
-            parts =  re.split(",|:|\r\n|\r",data.strip())
-            parts = list(map(str.strip,parts))
-            length = len(parts)
-            print(parts)
-
-            MatchImei = re.match( r"^(353\d{12})\s+OK", data.strip(),re.MULTILINE)
-            if MatchImei:
-                self.deviceInfo["IMEI"] = MatchImei.group(1)
-
-            if data.find("+SKRGPSPOS:") != -1:
-                i = find_last(parts,"+SKRGPSPOS")
-                if parts[i+1]=="1":
-                    self.deviceInfo["LOC_STATUS"] = "Valid"
-                else:
-                    self.deviceInfo["LOC_STATUS"] = "Invalid"
-
-                self.deviceInfo["LOC_LAT"] = parts[i+2]
-                self.deviceInfo["LOC_LON"] = parts[i+3]
-                self.deviceInfo["LOC_ALT"] = parts[i+4]
-                self.deviceInfo["LOC_TIME"] = parts[i+5]+" "+parts[i+6]+":"+parts[i+7]+":"+parts[i+8]
-                self.deviceInfo["LOC_TIME"] = self.deviceInfo["LOC_TIME"].replace("/","-")
-
-                self.broadcast(self.deviceInfo)
-
-            if data.find("+SKCTIME:") != -1:
-                i = find_last(parts,"+SKCTIME")
-                self.deviceInfo["LOC_TIME"] = parts[i+1]+" "+parts[i+2]+":"+parts[i+3]+":"+parts[i+4]
-                self.deviceInfo["LOC_TIME"] = self.deviceInfo["LOC_TIME"].replace("/","-")
-                #os.system("date -s '"+info["LOC_TIME"]+"'")
-                self.broadcast(self.deviceInfo)
-
-            if data.find("RING") != -1:
-                logging.info("ringing")
-                self.broadcast({"respond":"ring","data":"Ringing"})
-
-            if data.find("+CSQ:") != -1:
-                i = find_last(parts,"+CSQ")
-
-                ts = int(time.time())
-                sqlstr="INSERT INTO gsps_snr_ber (snr ,ber,timestamp) VALUES( ?,?,?)"
-                self.db.execute(sqlstr,(parts[i+1],parts[i+2],ts))
-                self.db.commit()
-
-                csq ={"respond":"csq","rssi":parts[i+1], "ber":parts[i+2]}
-                self.broadcast(csq)
-                    
-            if data.find("+CMGS:") != -1:
-                self.WaitingForCMGS = False
-                i = find_last(parts,"+CMGS")
-                logging.info("SMS:"+parts[i+1]+" LENGTH:"+parts[i+2])
-
-                sqlstr="UPDATE sms set status = 'sent' where SMS_ID=?"
-                self.db.execute(sqlstr,(self.InsertId,))
-                self.db.commit()
-
-                self.broadcast({"respond":"call_info","data":"SMS Sent"})
-
-            if data.find("+CMT:") != -1:
-                i = find_last(parts,"+CMT")
-                sms = SmsDeliver(parts[i+3])
-
-                sql = "INSERT INTO sms (TYPE, BNUM, CONTENT,LENGTH,status) VALUES (?,?,?,?,?)"
-                self.db.execute(sql, (0,sms.number,sms.text,parts[i+2],'receieved'))
-                self.db.commit()
-                self.broadcast({"respond":"sms","from":sms.number,"text":sms.text})
-
-            if data.find("+CREG:") != -1:
-                i = find_last(parts,"+CREG")
-                if i+4 < length and parts[i+4] =="OK" :
-                    offset = 0
-                elif i+6 <= length and parts[i+6] =="OK" :
-                    offset = 0
-                    lac =int(parts[i+3+offset].replace('"',''),16)
-                    self.deviceInfo["CI"] = "LRFCN:"+ str(int(parts[i+4+offset].replace('"',''),16))
-                    self.deviceInfo["LAC"] = "RNC:"+str(lac >> 10)+" , SB:"+str(lac & 1023)
-                else:
-                    offset = -1
-                    lac =int(parts[i+3+offset].replace('"',''),16)
-                    self.deviceInfo["CI"] = "LRFCN:"+ str(int(parts[i+4+offset].replace('"',''),16))
-                    self.deviceInfo["LAC"] = "RNC:"+str(lac >> 10)+" , SB:"+str(lac & 1023)
-
-                if  parts[i+2+offset] == "1" :
-                    REG  = "Yes"
-                    self.IsRegistered = True
-                    self.deviceInfo["additional"]= ""
-
-                elif parts[i+2+offset] == "2" :
-                    self.IsRegistered = False
-                    REG  = "Searching .... "
-                    self.deviceInfo["additional"]= REG
-
-                else:
-                    self.IsRegistered = False
-                    REG  = "No"
-                    self.deviceInfo["additional"]= "not registered"
-
-
-                self.deviceInfo["REG"] = REG
-
-            if data.find("+SKCCSI:") != -1:
-                i = find_last(parts,"+SKCCSI")
-
-                val =""
-
-                if parts[i+2] =="0" and i+6 < length:
-                    sqlstr="UPDATE call_log set disc_cause = ? ,call_stat = ?  where call_id =? "
-                    self.db.execute(sqlstr,(parts[i+6],parts[i+3],str(self.LastCallId)))
-                    self.db.commit()
-
-                if parts[i+3] == "2":
-                    val ="Outgoing call to : "+parts[i+7]
-                elif parts[i+3] == "0":
-                    val ="User picked up the call "
-                elif parts[i+3] == "3":
-                    val ="Outgoing call to : "+parts[i+7]   +" on progress"
-                    self.status["ONG"] = 1
-                    self.status["LAST_CALL"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                elif parts[i+3] == "4":
-                    val ="Incoming call from : "+parts[i+7] +" on progress"
-
-                    if self.config["mt_auto_answer"]:
-                        if self.config["mt_number"].strip() == "" or parts[i+7].strip() == self.config["mt_number"].strip() :
-                            self.write("ATA" + '\r\n')
-
-                    self.status["ONG"] = 1
-
-                elif parts[i+3] == "6":
-                    val ="call disconnected"
-                    self.status["ONG"] = 0
-                
-                self.broadcast(self.deviceInfo)
-
-            if data.find("+SKCTVI:") != -1:
-                i = find_last(parts,"+SKCTVI")
-                val ="Call lasted for "+parts[i+2]+"s"
-
-                sqlstr="UPDATE call_log set dur = ? where  call_id =? "
-                self.db.execute(sqlstr,(parts[i+2],str(self.LastCallId)))
-                self.db.commit()
-
-                self.broadcast({"respond":"call_info","data":val})
-
-            if data.find("+CIMI:") != -1:
-                i = find_last(parts,"+CIMI")
-                self.deviceInfo["IMSI"] = parts[i+1].replace('"','')
-
-                #sql="REPLACE INTO site_meta (type ,value) VALUES( 'IMSI', ?)"
-                #self.db.execute(sql,(self.deviceInfo["IMSI"],))
-                #self.db.commit()
-
-                #if self.deviceInfo["IMSI"] != self.config["IMSI"] :
-                    #logging.warning("IMSI changed from "+self.config["IMSI"]+" to "+self.deviceInfo["IMSI"])
-
-                self.broadcast(self.deviceInfo)
-
-            if data.find("+CIND:") != -1:
-                i = find_last(parts,"+CIND")
-                self.status["SIG"] =parts[i+1]
-                self.status["SERVICE"] = "Ready for service" if parts[i+2]=="1" else "No service"
-                self.status["ROAM"] =  "Yes" if parts[i+3]=="1" else "No"
-                self.status["SMS_FULL"] =parts[i+4]
-
-                self.broadcast(self.status)
-
-            if data.find("+SKCNLI:") != -1:
-                i = find_last(parts,"+SKCNLI")
-                self.status["PROV1"] =parts[i+1]
-                self.status["PROV2"] =parts[i+2]
-                self.status["MCC"] =parts[i+3]
-                self.status["CID"] =parts[i+5]
-
-                self.broadcast(self.status)
-
-            if data.find("+SKMODEL:") != -1:
-                i = find_last(parts,"+SKMODEL")
-                self.deviceInfo["MODEL"] =parts[i+1].replace('"','')
-                #self.broadcast(self.deviceInfo)
-
-            if data.find("+SKGPSPOSI:") != -1:
-                i = parts.index("+SKGPSPOSI")
-                self.status["LOC_STATUS"] == "Valid" if parts[i+1]=="1" else "Invalid"
-                self.broadcast(self.status)
-
-            if data.find("+CIEV:") != -1:
-                i = find_last(parts,"+CIEV")
-                index = int(parts[i+1])
-                value = parts[i+2]
-                cind = {1:"BAT",2:"SIG",3:"SERVICE",4:"SOUNDER",5:"SMS_REC",6:"CALL_IN_PROGRESS",7:"TX",8:"ROAM",9:"SMS_FULL"}
-                if cind[index] =="SERVICE":
-                    value = "Ready for service" if value=="1" else "No service"
-
-                self.status[cind[index]]= value
-                self.broadcast(self.status)
-
-            if data.find("+SKEXTREG:") != -1:
-                i = find_last(parts,"+SKEXTREG")
-                index = parts[i+1]
-                self.status["additional"]= index
-                self.broadcast(self.status)
-
-        except Exception as e:
-            logging.error(str(e))
-
-        #logging.debug(data.replace('OK','').strip())
-        #print info
 
     def get_device_info(self):
         return {"error":"","data":self.deviceInfo}
@@ -511,10 +538,10 @@ class GSPS:
         self.SMSQueue.push({'dest':dest,'content':content})
 
     def power_cycle(self):
-        self.conn.write('AT+SKCKPD="E",1' + '\r\n')
+        self.conn.write(b'AT+SKCKPD="E",1\r\n')
 
     def hangup(self):
-        self.conn.write("ATH" + '\r\n')
+        self.conn.write(b"ATH\r\n")
     
     def broadcast(self,data):
         removed = []
@@ -531,4 +558,8 @@ class GSPS:
     def add_to(self,sock):
         self.wss.append(sock)
 
-ic = GSPS()
+    def get_status(self):
+        return {"error":"","data":self.status}
+
+    def get_snr(self):
+        return {"error":"","data":self.signal}
