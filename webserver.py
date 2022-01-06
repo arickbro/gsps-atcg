@@ -14,7 +14,6 @@ ic = GSPS()
 @sock.route('/echo', methods=['GET'])
 def echo(sock):
     print(request.args.get('start'))
-    sock.send("welcome")
     ic.add_to(sock)
     while True:
         data = sock.receive()
@@ -23,19 +22,38 @@ def echo(sock):
 
 @app.route('/status', methods=['GET'])
 def get_status():
-    return json.dumps(ic.get_status())
-
+    response = app.response_class(
+        response=json.dumps(ic.get_status()),
+        status=200,
+        mimetype='application/json'
+    )
+    return response
 @app.route('/configuration', methods=['GET'])
 def get_config_from_db():
-    return json.dumps(ic.get_config_from_db())
+    response = app.response_class(
+        response=json.dumps(ic.get_config_from_db()),
+        status=200,
+        mimetype='application/json'
+    )
+    return response
 
 @app.route('/info', methods=['GET'])
 def get_info():
-    return json.dumps(ic.get_device_info())
+    response = app.response_class(
+        response=json.dumps(ic.get_device_info()),
+        status=200,
+        mimetype='application/json'
+    )
+    return response
 
 @app.route('/snr', methods=['GET'])
 def last():
-    return json.dumps(ic.get_snr())
+    response = app.response_class(
+        response=json.dumps(ic.get_snr()),
+        status=200,
+        mimetype='application/json'
+    )
+    return response
 
 @app.route('/historical_snr', methods=['GET'])
 def get_historical_snr():
@@ -45,7 +63,7 @@ def get_historical_snr():
     parameter['bucket'] = request.form.get('bucket')
     return json.dumps(ic.get_historical_snr(parameter))
 
-@app.route('/smss', methods=['GET'])
+@app.route('/smses', methods=['GET'])
 def get_sms():
     parameter = {}
     parameter['start'] = request.form.get('start')
@@ -68,7 +86,7 @@ def exec():
     result = {"error":"","data":{}}
     try:
         cmd = request.form.get('cmd')
-        result['data'] = ic.write(bytes(cmd+"\n", 'utf-8'))
+        result =  ic.write(bytes(cmd+"\r\n", 'utf-8'),b"OK")
     except Exception as e:
         result["error"] = str(e)
 
@@ -76,13 +94,46 @@ def exec():
 
 @app.route('/call', methods=['POST'])
 def send_call():
-    string = ic.make_call(request.json)
-    return string
+    result = {"error":"","data":{}}
+    try:
+        dest = request.form.get('dest')
+        timeout = int(request.form.get('duration'))
+        result['data'] = ic.make_call(dest,timeout)
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+@app.route('/hangup', methods=['GET'])
+def hangup():
+    result = {"error":"","data":{}}
+    try:
+        result =  ic.write(bytes("ATH\r\n", 'utf-8'),b"OK")
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+
+@app.route('/reboot_terminal', methods=['GET'])
+def power_cycle():
+    result = {"error":"","data":{}}
+    try:
+        result['data'] = ic.power_cycle()
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
 
 @app.route('/sms', methods=['POST'])
 def send_sms():
-    string = ic.make_sms(request.json)
-    return string
+    result = {"error":"","data":{}}
+    try:
+        dest = request.form.get('dest')
+        content = request.form.get('content')
+        result['data'] = ic.make_sms(dest,content)
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
 
 @app.route('/configuration', methods=['POST'])
 def set_config():

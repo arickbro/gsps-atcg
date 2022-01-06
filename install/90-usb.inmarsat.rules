@@ -1,0 +1,1 @@
+ACTION=="add", ATTRS{interface}=="IsatPhone 2 Modem Interface",  SYMLINK+="inmarsat", TAG+="systemd", ENV{SYSTEMD_WANTS}="gsps-atcg.service"

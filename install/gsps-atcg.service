@@ -1,0 +1,11 @@
+[Unit]
+Description=Inmarsat-GSPS
+BindsTo=dev-inmarsat.device
+After=dev-inmarsat.device
+
+[Install]
+WantedBy=dev-inmarsat.device
+
+[Service]
+type=simple
+ExecStart=/bin/python3 /home/arickbro/vscode/gsps-atcg/webserver.py
