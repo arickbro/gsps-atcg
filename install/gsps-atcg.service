@@ -8,4 +8,4 @@ WantedBy=dev-inmarsat.device
 
 [Service]
 type=simple
-ExecStart=/bin/python3 /home/arickbro/vscode/gsps-atcg/webserver.py
+ExecStart=/bin/python3 /home/pi/gsps-atcg/webserver.py

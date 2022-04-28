@@ -1,7 +1,9 @@
 import threading
 import logging
 import time
+import os
 from gsps_helper import *
+from error_code import *
 from messaging.sms import SmsDeliver
 
 logging.basicConfig(format='%(levelname)s:%(message)s', level=logging.DEBUG)
@@ -58,18 +60,18 @@ class ReaderThread(threading.Thread):
                 self.main.deviceInfo["gpsTimestamp"] = parts[i+5]+" "+parts[i+6]+":"+parts[i+7]+":"+parts[i+8]
                 self.main.deviceInfo["gpsTimestamp"] = self.main.deviceInfo["gpsTimestamp"].replace("/","-")
 
-                self.main.broadcast({'respond':'deviceInfo','data':self.main.deviceInfo})
+                #self.main.broadcast({'respond':'deviceInfo','data':self.main.deviceInfo})
 
             if data.find("+SKCTIME:") != -1:
                 i = find_last(parts,"+SKCTIME")
                 self.main.deviceInfo["gpsTimestamp"] = parts[i+1]+" "+parts[i+2]+":"+parts[i+3]+":"+parts[i+4]
                 self.main.deviceInfo["gpsTimestamp"] = self.main.deviceInfo["gpsTimestamp"].replace("/","-")
-                #os.system("date -s '"+info["LOC_TIME"]+"'")
-                self.main.broadcast({'respond':'deviceInfo','data':self.main.deviceInfo})
+                os.system("date -s '"+self.main.deviceInfo["gpsTimestamp"]+"'")
+                #self.main.broadcast({'respond':'deviceInfo','data':self.main.deviceInfo})
 
             if data.find("RING") != -1:
                 logging.info("ringing")
-                self.main.broadcast({"respond":"ring","data":"Ringing"})
+                self.main.broadcast({"respond":"call_info","data":"Ringing"})
 
             if data.find("+CSQ:") != -1:
                 i = find_last(parts,"+CSQ")
@@ -79,13 +81,19 @@ class ReaderThread(threading.Thread):
                 self.main.db.execute(sqlstr,(parts[i+1],parts[i+2],ts))
                 self.main.db.commit()
 
-                self.main.signal = {'ts':ts,'rssi':parts[i+1], 'ber':parts[i+2]}
+                self.main.signal = {
+                    "ts":ts,"rssi":parts[i+1], 
+                    "ber":parts[i+2],
+                    "rnc":self.main.deviceInfo["locationAreaCode"]["RNC"],
+                    "beam":self.main.deviceInfo["locationAreaCode"]["SB"], 
+                    "imsi":self.main.deviceInfo["IMSI"]
+                }
                 self.main.broadcast({"respond":"rssi","data":self.main.signal})
                     
             if data.find("+CMGS:") != -1:
-                self.main.WaitingForCMGS = False
+
                 i = find_last(parts,"+CMGS")
-                logging.info("SMS:"+parts[i+1]+" LENGTH:"+parts[i+2])
+                logging.debug("SMS:"+parts[i+1]+" LENGTH:"+parts[i+2])
 
                 sqlstr="UPDATE sms_log set status = 'sent' where sms_id=?"
                 self.main.db.execute(sqlstr,(self.main.LastSMSId,))
@@ -96,12 +104,12 @@ class ReaderThread(threading.Thread):
             if data.find("+CMT:") != -1:
                 i = find_last(parts,"+CMT")
                 sms = SmsDeliver(parts[i+3])
-
-                sql = "INSERT INTO sms_log (type, dest, content,content_length,status) VALUES (?,?,?,?,?)"
-                self.main.db.execute(sql, (0,sms.number,sms.text,parts[i+2],'receieved'))
+                #type 1=MO, 2=MT
+                sql = "INSERT INTO sms_log (timestamp, type, dest, content,content_length,status) VALUES (?,?,?,?,?,?)"
+                self.main.db.execute(sql, (int(time.time()),0,sms.number,sms.text,parts[i+2],'receieved'))
                 self.main.db.commit()
                 self.main.LastSMSId =  self.main.db.cursor().lastrowid
-                self.main.broadcast({"respond":"sms","data":{"from":sms.number,"text":sms.text}})
+                self.main.broadcast({"respond":"call_info","data":"SMS from "+sms.number+" text:"+sms.text})
                 
             if data.find("+CREG:") != -1:
                 i = find_last(parts,"+CREG")
@@ -142,6 +150,7 @@ class ReaderThread(threading.Thread):
                 val =""
 
                 if parts[i+2] =="0" and i+6 < length:
+                    logging.debug("last call ID:"+str(self.main.LastCallId))
                     sqlstr="UPDATE call_log set disc_cause = ? ,call_stat = ?  where call_id =? "
                     self.main.db.execute(sqlstr,(parts[i+6],parts[i+3],str(self.main.LastCallId)))
                     self.main.db.commit()
@@ -149,7 +158,7 @@ class ReaderThread(threading.Thread):
                 if parts[i+3] == "2":
                     val ="Outgoing call to : "+parts[i+7]
                 elif parts[i+3] == "0":
-                    val ="User picked up the call "
+                    val ="Called party picked up the call "
                 elif parts[i+3] == "3":
                     val ="Outgoing call to : "+parts[i+7]   +" on progress"
                     self.main.status["ongoingCall"] = 1
@@ -164,15 +173,15 @@ class ReaderThread(threading.Thread):
                     self.main.status["ongoingCall"] = 1
 
                 elif parts[i+3] == "6":
-                    val ="call disconnected"
+                    val ="Call disconnected"
                     self.main.status["ongoingCall"] = 0
                 
-                self.main.broadcast({'respond':'deviceInfo','data':self.main.deviceInfo})
+                self.main.broadcast({'respond':'call_info','data':val})
             if data.find("+SKCTVI:") != -1:
                 i = find_last(parts,"+SKCTVI")
                 val ="Call lasted for "+parts[i+2]+"s"
 
-                sqlstr="UPDATE call_log set dur = ? where  call_id =? "
+                sqlstr="UPDATE call_log set duration = ? where  call_id =? "
                 self.main.db.execute(sqlstr,(parts[i+2],str(self.main.LastCallId)))
                 self.main.db.commit()
 
@@ -186,7 +195,7 @@ class ReaderThread(threading.Thread):
                     logging.warning("IMSI changed from "+self.main.config["IMSI"]+" to "+self.main.deviceInfo["IMSI"])
 
                 self.main.deviceInfo["IMSI"] = IMSI
-                self.main.broadcast({'respond':'deviceInfo','data':self.main.deviceInfo})
+                #self.main.broadcast({'respond':'deviceInfo','data':self.main.deviceInfo})
 
             if data.find("+CIND:") != -1:
                 i = find_last(parts,"+CIND")
@@ -195,7 +204,7 @@ class ReaderThread(threading.Thread):
                 self.main.status["isRoaming"] =  "Yes" if parts[i+3]=="1" else "No"
                 self.main.status["isSmsFull"] =parts[i+4]
 
-                self.main.broadcast({'respond':'deviceStatus','data':self.main.status})
+                #self.main.broadcast({'respond':'deviceStatus','data':self.main.status})
 
             if data.find("+SKCNLI:") != -1:
                 i = find_last(parts,"+SKCNLI")
@@ -204,7 +213,7 @@ class ReaderThread(threading.Thread):
                 self.main.status["mcc"] =parts[i+3]
                 self.main.status["cid"] =parts[i+5]
 
-                self.main.broadcast({'respond':'deviceStatus','data':self.main.status})
+                #self.main.broadcast({'respond':'deviceStatus','data':self.main.status})
 
             if data.find("+SKMODEL:") != -1:
                 i = find_last(parts,"+SKMODEL")
@@ -215,7 +224,23 @@ class ReaderThread(threading.Thread):
                 i = parts.index("+SKGPSPOSI")
                 self.main.deviceInfo["gpsStatus"] == "Valid" if parts[i+1]=="1" else "Invalid"
                 #self.main.broadcast(self.main.deviceInfo)
+                
+            if data.find("+CME ERROR") != -1:
+                i = parts.index("+CME ERROR")
+                errorCode = int(parts[i+1])
+                if errorCode in cmeError :
+                    logging.error(cmeError[errorCode])    
 
+            if data.find("+CMS ERROR") != -1:
+                i = parts.index("+CMS ERROR")
+                errorCode = int(parts[i+1])
+                if errorCode in cmsError :
+                    logging.error(cmsError[errorCode])   
+                    
+            if data.find("+SKICCID") != -1:
+                i = parts.index("+SKICCID")
+                self.main.deviceInfo["ICCID"] =parts[i+1]
+                    
             if data.find("+CIEV:") != -1:
                 i = find_last(parts,"+CIEV")
                 index = int(parts[i+1])
@@ -225,14 +250,14 @@ class ReaderThread(threading.Thread):
                     value = "Ready for service" if value=="1" else "No service"
 
                 self.main.status[cind[index]]= value
-                self.main.broadcast({'respond':'deviceStatus','data':self.main.status})
+                #self.main.broadcast({'respond':'deviceStatus','data':self.main.status})
 
             if data.find("+SKEXTREG:") != -1:
                 i = find_last(parts,"+SKEXTREG")
                 index = parts[i+1]
                 self.main.deviceInfo["registrationInfo"]= index
 
-            self.main.broadcast({'respond':'raw','data':data.strip()})
+            self.main.broadcast({"respond":"raw","data":data.strip()})
 
         except Exception as e:
             logging.error(str(e))

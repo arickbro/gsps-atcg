@@ -5,13 +5,14 @@ from gsps_helper import *
 from serial_reader import *
 from messaging.sms import SmsSubmit
 from messaging.sms import SmsDeliver
+from error_code import *
 
 import time
 import logging
 import threading
 import glob
 import re
-
+import json
 
 logging.basicConfig(format='%(levelname)s:%(message)s', level=logging.DEBUG)
 
@@ -22,9 +23,9 @@ class GSPS:
         self.atcgOnGoing = False
         self.conn = False
         self.LastCallId = None
+        self.LastSMSId = None
         self.wss = []
         self.ports = []
-        self.SMSQueue = []
         self.deviceInfo = {
             'IMSI':None,
             'IMEI':None,
@@ -33,10 +34,11 @@ class GSPS:
             'gpsLatitude':None,
             'gpsLongitude':None,
             'cellIdentity':None,
-            'locationAreaCode':None,
+            'locationAreaCode':{'RNC':None,'SB':None},
             'gpsTimestamp':None,
             'registered':None,
             'registrationInfo':None,
+            'ICCID':None
         }
         self.status = {
             'battery':None,
@@ -57,11 +59,11 @@ class GSPS:
         }
         
         self.lock = threading.Lock() 
-        self.signal ={'ts':0,'rssi':None, 'ber':None}
+        self.signal ={'ts':0,'rssi':None, 'ber':None, 'rnc':None,'imsi':None,'beam':None}
         
         self.gb = 0
         self.config = {}
-        self.db = sqlite3.connect('/home/arickbro/vscode/gsps-atcg/isatc.db',check_same_thread=False)
+        self.db = sqlite3.connect('/home/pi/gsps-atcg/isatc.db',check_same_thread=False)
         self.get_config_from_db()
 
         #make sure the UT ready
@@ -75,15 +77,21 @@ class GSPS:
         self.thread.start()
 
     def get_port(self):
-        self.ports = serial.tools.list_ports.comports()
+        ports = serial.tools.list_ports.comports()
         regex = r"isatphone|isat|oceana|terra"
+        
+        
+        self.ports = []
+        for port, desc, hwid in sorted(ports):
+            self.ports.append({'port':port,'desc':desc})
+
         return "/dev/inmarsat"
         
         for port, desc, hwid in sorted(self.ports):
             desc = desc.lower()
-            print("{}: {} [{}]".format(port, desc, hwid))
             if desc.find("modem")  != -1 and re.search(regex, desc, re.IGNORECASE | re.DOTALL):
                 return port
+                
         return False
 
     def get_config_from_db(self):
@@ -108,7 +116,7 @@ class GSPS:
         result = {"error":""}
         try:
             for key in config:
-                self.db.execute("update gsps_config set config_value=? where config_name=?",(config[key],key))
+                self.db.execute("update isatc_config set config_value=? where config_name=?",(config[key],key))
                 self.db.commit()
             self.get_config_from_db()
         except Exception as e:
@@ -117,9 +125,10 @@ class GSPS:
         return result
 
     def get_historical_snr(self,param):
-        result = {"error":"","data":[]}
+        logging.debug(param)
+        result = {"error":"","data":[], "columns":["timestamp","snr","rssi","ber"]}
         try:
-            sql = "select (timestamp/?)*? as ts, avg(signal_level), sum(ber) as snr from gsps_snr_ber where timestamp >= ? and timestamp < ? group by ts "
+            sql = "select (timestamp/?)*? as ts, avg(snr), ROUND(-133+ (AVG(snr)*0.5),2) as rssi, sum(ber) as snr from gsps_snr_ber where timestamp >= ? and timestamp < ? group by ts "
             cursor = self.db.execute(sql, (param['bucket'],param['bucket'],param['start'],param['end']))
             for row in cursor:
                 result["data"].append(row)
@@ -129,11 +138,11 @@ class GSPS:
 
     def get_calls(self,param):
 
-        result = {"error":"","columns":["timestamp","call_id","disc_cause","call_stat","dest_num"], "rows":[],"count":None}
+        result = {"error":"","columns":["timestamp","call_id","disc_cause","call_stat","dest_num","duration"], "data":[],"count":None}
         sql = "select count(timestamp) from call_log where timestamp >= ? and timestamp < ? "
         try:
             cursor = self.db.execute(sql, (param['start'],param['end']))
-            result["output"] = cursor.fetchone()[0]
+            result["count"] = cursor.fetchone()[0]
             
             sql = "select "+",".join(result["columns"])+" from call_log where timestamp >= ? and timestamp < ?  LIMIT ? OFFSET ?"
             cursor = self.db.execute(sql, (param['start'],param['end'],param['limit'],param['offset']))
@@ -145,11 +154,11 @@ class GSPS:
 
     def get_sms(self,param):
 
-        result = {"error":"","columns":["timestamp","sms_id","type","dest","content","content_length","status"], "rows":[],"count":None}
+        result = {"error":"","columns":["timestamp","sms_id","type","dest","content","content_length","status"], "data":[],"count":None}
         sql = "select count(timestamp) from sms_log where timestamp >= ? and timestamp < ? "
         try:
             cursor = self.db.execute(sql, (param['start'],param['end']))
-            result["output"] = cursor.fetchone()[0]
+            result["count"] = cursor.fetchone()[0]
             
             sql = "select "+",".join(result["columns"])+" from sms_log where timestamp >= ? and timestamp < ?  LIMIT ? OFFSET ?"
             cursor = self.db.execute(sql, (param['start'],param['end'],param['limit'],param['offset']))
@@ -228,9 +237,15 @@ class GSPS:
         if self.lock.locked():  
             self.lock.release()
 
-        erorr =  singleLine(r"ERROR: (\d+)",string)
-
-        return {'data':string,'error':erorr}
+        error =  singleLine(r"CME ERROR: (\d+)",string)
+        if error != None  and int(error) in cmeError:
+            return {'data':string,'error':error , 'desc':"CME ERROR ["+error+"] "+cmeError[int(error)]}
+            
+        error =  singleLine(r"CMS ERROR: (\d+)",string)
+        if error != None  and int(error) in cmeError:
+            return {'data':string,'error':error , 'desc':"CMS ERROR ["+error+"] "+cmsError[int(error)]}
+            
+        return {'data':string,'error':error}
         
     def get_ut_parameter(self):
         if self.conn.isOpen() :
@@ -252,7 +267,9 @@ class GSPS:
             time.sleep(0.5)
             self.write(b"AT+CGSN\r\n")
             time.sleep(0.5)
-
+            self.write(b"AT+SKICCID\r\n")
+            time.sleep(0.5)
+            
     def fetch_snr(self):
         self.write(b"AT+CSQ\r\n")
 
@@ -260,10 +277,11 @@ class GSPS:
     def make_call(self,dest,timeout=False):
         string = "ATD"+dest+";" + '\r\n'
         self.write(bytes(string,'utf-8'))
+        cursor = self.db.cursor()
         sql ="INSERT INTO `call_log`( `dest_num`, `call_stat`,`disc_cause`,timestamp) VALUES (?,?,?,?)"
-        self.db.execute(sql,(dest,0,0,int(time.time())))
+        cursor.execute(sql,(dest,0,0,int(time.time())))
         self.db.commit()
-        self.LastCallId =  self.db.cursor().lastrowid
+        self.LastCallId =  cursor.lastrowid
 
         if timeout != False:                               
             time.sleep(timeout)
@@ -277,6 +295,13 @@ class GSPS:
             time.sleep(0.1)
             smsString = '%s\x1a' % pdu.pdu
             self.write(bytes(smsString,'utf-8'), "CMGS")
+
+        cursor = self.db.cursor()
+        sql = "INSERT INTO sms_log (timestamp, type, dest, content,status) VALUES (?,?,?,?,?)"
+        cursor.execute(sql,(int(time.time()),1, dest,content,'pending'))
+        self.db.commit()
+        self.LastSMSId =  cursor.lastrowid
+        
 
     def keep_alive(self):
         currentEpoch = 0
@@ -293,13 +318,19 @@ class GSPS:
                     lastEpoch = currentEpoch
                     logging.debug("check signal level")
                     self.fetch_snr()
-                    self.broadcast("lorem")
+                    
                 ''' make a call every configurable interval '''
-                
                 if self.config["enable_atcg"] and  currentEpoch - lastEpochCall >= self.config["atcg_interval"]    :
                     lastEpochCall = currentEpoch
                     self.make_call(self.config["atcg_dest"])
                     self.atcgOnGoing = True
+                
+                ''' disconnect the call based on duration '''
+                if self.atcgOnGoing and  currentEpoch -lastEpochCall >= self.config["atcg_duration"] :
+                    self.conn.write(b"ATH\r\n")
+                    time.sleep(10)
+                    self.atcgOnGoing = False
+                            
                 
             except Exception as e:
                 logging.error(str(e))
@@ -311,9 +342,10 @@ class GSPS:
     def get_device_info(self):
         self.deviceInfo['isSerialConnected'] = self.isConnected
         return {"error":"","data":self.deviceInfo}
-
-    def add_sms_to_queue(self,dest,content):
-        self.SMSQueue.push({'dest':dest,'content':content})
+        
+    def get_ports(self):
+        return {"error":"","data":self.ports}
+        
 
     def power_cycle(self):
         self.conn.write(b'AT+SKCKPD="E",1\r\n')
@@ -326,7 +358,7 @@ class GSPS:
         removed = []
         for ws in self.wss:
             try:
-                ws.send(data)
+                ws.send(json.dumps(data))
             except Exception as e:
                 logging.warning(str(e))
                 removed.append(ws)

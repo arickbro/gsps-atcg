@@ -54,31 +54,41 @@ def last():
         mimetype='application/json'
     )
     return response
-
+    
+@app.route('/ports', methods=['GET'])
+def ports():
+    response = app.response_class(
+        response=json.dumps(ic.get_ports()),
+        status=200,
+        mimetype='application/json'
+    )
+    return response
+    
+    
 @app.route('/historical_snr', methods=['GET'])
 def get_historical_snr():
     parameter = {}
-    parameter['start'] = request.form.get('start')
-    parameter['end'] = request.form.get('end')
-    parameter['bucket'] = request.form.get('bucket')
+    parameter['start'] = int(request.args.get('start'))
+    parameter['end'] = int(request.args.get('end'))
+    parameter['bucket'] = int(request.args.get('bucket'))
     return json.dumps(ic.get_historical_snr(parameter))
 
 @app.route('/smses', methods=['GET'])
 def get_sms():
     parameter = {}
-    parameter['start'] = request.form.get('start')
-    parameter['end'] = request.form.get('end')
-    parameter['offset'] = request.form.get('offset')
-    parameter['limit'] = request.form.get('limit')
+    parameter['start'] = int(request.args.get('start'))
+    parameter['end'] = int(request.args.get('end'))
+    parameter['offset'] = int(request.args.get('offset'))
+    parameter['limit'] = int(request.args.get('limit'))
     return json.dumps(ic.get_sms(parameter))
 
 @app.route('/calls', methods=['GET'])
 def get_calls():
     parameter = {}
-    parameter['start'] = request.form.get('start')
-    parameter['end'] = request.form.get('end')
-    parameter['offset'] = request.form.get('offset')
-    parameter['limit'] = request.form.get('limit')
+    parameter['start'] = int(request.args.get('start'))
+    parameter['end'] = int(request.args.get('end'))
+    parameter['offset'] = int(request.args.get('offset'))
+    parameter['limit'] = int(request.args.get('limit'))
     return json.dumps(ic.get_calls(parameter))
 
 @app.route('/command', methods=['POST'])
@@ -97,7 +107,12 @@ def send_call():
     result = {"error":"","data":{}}
     try:
         dest = request.form.get('dest')
-        timeout = int(request.form.get('duration'))
+        duration = request.form.get('duration')
+        if duration == None:
+            timeout = False
+        else:
+            timeout = int(request.form.get('duration'))
+            
         result['data'] = ic.make_call(dest,timeout)
     except Exception as e:
         result["error"] = str(e)
@@ -140,4 +155,4 @@ def set_config():
     return json.dumps(ic.set_config(request.json))
 
 if __name__ == '__main__':
-    app.run()
+    app.run(host='0.0.0.0', port=80)
